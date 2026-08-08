@@ -1,0 +1,46 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# uv / poetry
+.uv/
+uv.lock
+poetry.lock
+
+# tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox/
+
+# secrets & runtime
+.secrets.baseline
+*.log
+runs/
+artifacts/
+findings/
+!findings/.gitkeep
+
+# bug-bounty operational data — NEVER commit
+scope/*.json
+platform_tokens/
+oob_state/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# docker / benchmarks
+.flagsalt
+*.flag
