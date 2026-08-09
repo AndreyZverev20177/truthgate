@@ -70,12 +70,15 @@ def run(
     scope = None
     if scope_file and scope_file.exists():
         import yaml
-        scope = load_from_dict(yaml.safe_load(scope_file.read_text()))
+        # utf-8-sig прозрачно съедает BOM, который PowerShell `Out-File -Encoding utf8` пишет
+        scope = load_from_dict(yaml.safe_load(scope_file.read_text(encoding="utf-8-sig")))
 
     cands: list[Candidate] = []
     if candidates_file and candidates_file.exists():
-        for row in json.loads(candidates_file.read_text()):
-            cands.append(Candidate(**row))
+        raw = candidates_file.read_text(encoding="utf-8-sig").strip()
+        if raw:
+            for row in json.loads(raw):
+                cands.append(Candidate(**row))
 
     ctx = ValidatorContext(
         target=target,
