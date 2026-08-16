@@ -1,0 +1,27 @@
+# Truthgate: единый режим LF для текстовых артефактов.
+# Требование окружения: WSL Ubuntu на Windows-хосте (см. project instructions).
+* text=auto eol=lf
+
+*.py     text eol=lf
+*.pyi    text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.json   text eol=lf
+*.toml   text eol=lf
+*.cfg    text eol=lf
+*.ini    text eol=lf
+*.txt    text eol=lf
+*.sh     text eol=lf
+Makefile text eol=lf
+
+# Бинарники — без нормализации.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.pdf    binary
+*.zip    binary
+*.gz     binary
+*.tar    binary
+*.wasm   binary
