@@ -44,9 +44,11 @@ packages = ["orchestrator", "tools", "phase1"]
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
     "ruff>=0.5.0",
     "mypy>=1.10",
     "pre-commit>=3.7",
+    "types-PyYAML",
 ]
 
 [tool.ruff]
@@ -79,12 +81,16 @@ disallow_untyped_defs = false
 
 [tool.pytest.ini_options]
 minversion = "8.0"
-testpaths = ["tests", "tools/validators/tests"]
+testpaths = ["tests", "tools/core/tests", "tools/validators/tests"]
 addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
 markers = [
     "slow: тест долгий (>2s)",
     "live: требует внешней цели / сети",
     "oob: требует OAST-инстанс",
+    "unit: unit-тест ядра (быстрый, без сети)",
+    "integration: интеграционный тест (несколько модулей, локальные ресурсы)",
+    "anti_fp: PASS на уязвимой цели, FAIL на безопасной — сердце валидатора",
 ]
 
 [tool.coverage.run]
