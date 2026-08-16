@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator import registry
+from tools.validators import registry
 
 
 @pytest.fixture(autouse=True)

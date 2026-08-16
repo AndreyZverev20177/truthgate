@@ -11,13 +11,16 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from orchestrator import __version__, registry
+from orchestrator import __version__
 from orchestrator.config import Config
 from orchestrator.oob import StubOOB
 from orchestrator.pipeline import run_pipeline
 from orchestrator.scope import load_from_dict
 from orchestrator.types import Candidate, ValidatorContext
 from orchestrator.worker import StaticWorker
+from tools.core.vulnerability_class import VulnerabilityClass
+from tools.validators import registry
+from tools.validators.normalize import aliases_for
 
 app = typer.Typer(
     name="truthgate",
@@ -43,13 +46,13 @@ def version() -> None:
 
 @app.command()
 def classes() -> None:
-    """Список зарегистрированных валидаторов (пусто в M0)."""
-    t = Table("bug_class", "known aliases")
-    for cls in registry.known_classes():
-        aliases = [k for k, v in registry.ALIASES.items() if v == cls]
-        t.add_row(cls, ", ".join(aliases) or "—")
-    if not registry.known_classes():
-        t.add_row("—", "(валидаторы подключаются в M1)")
+    """Полный enum + отметка зарегистрированных валидаторов + известные алиасы."""
+    known = set(registry.known_classes())
+    t = Table("bug_class", "registered?", "known aliases (normalize.py)")
+    for vc in VulnerabilityClass.all():
+        mark = "✅" if vc in known else "—"
+        aliases = aliases_for(vc)
+        t.add_row(vc.value, mark, ", ".join(aliases) or "—")
     console.print(t)
 
 

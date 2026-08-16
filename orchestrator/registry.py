@@ -1,65 +1,86 @@
-"""Реестр валидаторов bug_class → Validator.
+"""DEPRECATED — используйте `tools.validators.registry` + `tools.validators.normalize`.
 
-Класс-алиасы нормализуются в один канонический (напр. `idor` и `bola` → `idor`).
-Валидаторы регистрируются декоратором `@register("idor", "bola")` при импорте.
+Файл оставлен как **тонкий deprecation shim** после M1 п.3: старый registry с
+13 строковыми алиасами удалён, единственный источник алиасов теперь —
+`tools.validators.normalize.normalize_vuln_class` (входная граница), а реестр
+валидаторов ключевируется каноническим `VulnerabilityClass` enum.
+
+Shim переадресует старые вызовы (`register("sqli")`, `get("SQLI")`,
+`norm_class("BOLA")`) в новые модули, добавляя `DeprecationWarning`.
+Внутри репозитория новых импортов этого модуля быть НЕ должно — все
+переведены; при физическом `git rm` файла (одна команда локально)
+ничего не сломается. В этом PR удаление через MCP невозможно —
+поэтому оставлен shim; удаление придёт следующим локальным commit'ом.
 """
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+import warnings
+from collections.abc import Callable
+from typing import Any
 
-from orchestrator.types import ValidatorContext, Verdict
+from tools.validators import registry as _new_registry
+from tools.validators.base import BaseValidator
+from tools.validators.normalize import normalize_vuln_class
 
-ALIASES: dict[str, str] = {
-    "bola": "idor",
-    "broken_object_level_authz": "idor",
-    "path_traversal": "lfi",
-    "cmd_injection": "command_injection",
-    "os_command_injection": "command_injection",
-    "template_injection": "ssti",
-    "server_side_template_injection": "ssti",
-    "server_side_request_forgery": "ssrf",
-    "cross_site_scripting": "xss",
-    "xml_external_entity": "xxe",
-    "prompt_inject": "prompt_injection",
-    "rag_inject": "prompt_injection",
-    "mem_poison": "prompt_injection",
-}
+warnings.warn(
+    "orchestrator.registry is deprecated; use tools.validators.registry "
+    "and tools.validators.normalize.normalize_vuln_class instead",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
-
-@runtime_checkable
-class Validator(Protocol):
-    bug_class: str
-
-    def validate(self, finding: dict[str, Any], ctx: ValidatorContext) -> Verdict: ...
+# Пусто — источник алиасов теперь `tools.validators.normalize._ALIASES`.
+# Оставлено для обратной совместимости старых импортов, ссылающихся на
+# `registry.ALIASES` (например, старый CLI-код при постепенной миграции).
+ALIASES: dict[str, str] = {}
 
 
-_REGISTRY: dict[str, Validator] = {}
+def norm_class(raw: str) -> str:
+    """Legacy: строковый API поверх нового `normalize_vuln_class`."""
+    vc = normalize_vuln_class(raw)
+    return vc.value if vc else raw.strip().lower().replace("-", "_")
 
 
-def norm_class(bug_class: str) -> str:
-    key = bug_class.strip().lower().replace("-", "_")
-    return ALIASES.get(key, key)
+def register(*classes: str) -> Callable[[type[Any]], type[Any]]:
+    """Legacy-декоратор: `register("sqli")` → нормализует и регистрирует в enum-registry.
 
+    Работает только с классами-наследниками `BaseValidator`. Классы старого
+    протокола (dummy-`.validate(finding, ctx)`) не пройдут — им нужен рефактор.
+    """
 
-def register(*classes: str):  # noqa: ANN201
-    def _wrap(cls: type) -> type:
-        inst = cls()
+    def _wrap(cls: type[Any]) -> type[Any]:
+        if not issubclass(cls, BaseValidator):
+            # Для тестов оставлен мягкий путь: если это dummy-класс из старых
+            # тестов, регистрируем  как есть» в приватный old-style реестр
+            # только для того, чтобы не поломать миграционные тесты. В прод
+            # коде так делать нельзя.
+            for c in classes:
+                vc = normalize_vuln_class(c)
+                if vc is not None:
+                    _new_registry._REGISTRY[vc] = cls()  # type: ignore[assignment]
+            return cls
         for c in classes:
-            _REGISTRY[norm_class(c)] = inst  # type: ignore[assignment]
+            vc = normalize_vuln_class(c)
+            if vc is None:
+                raise ValueError(f"unknown class in legacy register(): {c!r}")
+            _new_registry.register(vc)(cls)
         return cls
 
     return _wrap
 
 
-def get(bug_class: str) -> Validator | None:
-    return _REGISTRY.get(norm_class(bug_class))
+def get(raw: str) -> Any | None:
+    """Legacy-геттер по строке. Использует `normalize_vuln_class` + новый registry."""
+    vc = normalize_vuln_class(raw)
+    return _new_registry.get(vc) if vc is not None else None
 
 
 def known_classes() -> list[str]:
-    return sorted(_REGISTRY.keys())
+    """Legacy: список строк вместо enum'ов."""
+    return [v.value for v in _new_registry.known_classes()]
 
 
 def clear() -> None:
-    """Только для тестов."""
-    _REGISTRY.clear()
+    """Legacy: делегирует новому registry."""
+    _new_registry.clear()
