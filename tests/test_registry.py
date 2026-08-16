@@ -14,9 +14,16 @@ def test_register_and_get() -> None:
     @registry.register("sqli")
     class _V:
         bug_class = "sqli"
+
         def validate(self, finding: dict, ctx: ValidatorContext) -> Verdict:
             _ = finding, ctx
-            return Verdict(True, "ok", 1.0, "sqli", "V")
+            return Verdict(
+                is_real=True,
+                evidence="ok",
+                confidence=1.0,
+                bug_class="sqli",
+                validator="V",
+            )
 
     v = registry.get("SQLI")
     assert v is not None
