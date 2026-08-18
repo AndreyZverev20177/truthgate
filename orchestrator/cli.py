@@ -11,13 +11,16 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from orchestrator import __version__, registry
+from orchestrator import __version__
 from orchestrator.config import Config
 from orchestrator.oob import StubOOB
 from orchestrator.pipeline import run_pipeline
 from orchestrator.scope import load_from_dict
 from orchestrator.types import Candidate, ValidatorContext
 from orchestrator.worker import StaticWorker
+from tools.core.vulnerability_class import VulnerabilityClass
+from tools.validators import registry
+from tools.validators.normalize import aliases_for
 
 app = typer.Typer(
     name="truthgate",
@@ -26,6 +29,25 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
+
+validators_app = typer.Typer(
+    name="validators",
+    help="Управление валидаторами (детерминированными детекторами).",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(validators_app, name="validators")
+
+
+@validators_app.command("list")
+def validators_list() -> None:
+    """Список зарегистрированных валидаторов (`truthgate validators list`)."""
+    known = registry.known_classes()
+    for vc in known:
+        v = registry.get(vc)
+        if v is None:
+            continue
+        console.print(f"{vc.value}  {v.name}")
 
 
 def _setup_logging(level: str) -> None:
@@ -37,19 +59,18 @@ def _setup_logging(level: str) -> None:
 
 @app.command()
 def version() -> None:
-    """Печатает версию."""
     console.print(f"truthgate {__version__}")
 
 
 @app.command()
 def classes() -> None:
-    """Список зарегистрированных валидаторов (пусто в M0)."""
-    t = Table("bug_class", "known aliases")
-    for cls in registry.known_classes():
-        aliases = [k for k, v in registry.ALIASES.items() if v == cls]
-        t.add_row(cls, ", ".join(aliases) or "—")
-    if not registry.known_classes():
-        t.add_row("—", "(валидаторы подключаются в M1)")
+    """Полный enum + отметка зарегистрированных + алиасы."""
+    known = set(registry.known_classes())
+    t = Table("bug_class", "registered?", "known aliases (normalize.py)")
+    for vc in VulnerabilityClass.all():
+        mark = "✅" if vc in known else "—"
+        aliases = aliases_for(vc)
+        t.add_row(vc.value, mark, ", ".join(aliases) or "—")
     console.print(t)
 
 
@@ -70,7 +91,6 @@ def run(
     scope = None
     if scope_file and scope_file.exists():
         import yaml
-        # utf-8-sig прозрачно съедает BOM, который PowerShell `Out-File -Encoding utf8` пишет
         scope = load_from_dict(yaml.safe_load(scope_file.read_text(encoding="utf-8-sig")))
 
     cands: list[Candidate] = []
@@ -91,7 +111,7 @@ def run(
     workers = [StaticWorker(cands)]
     try:
         findings = run_pipeline(workers, ctx, scope=scope)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         console.print(f"[red]pipeline error:[/] {e}")
         raise typer.Exit(1) from e
 
