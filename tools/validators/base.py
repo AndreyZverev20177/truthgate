@@ -16,27 +16,22 @@
    именно на стороне валидатора (defence in depth).
 
 2. **`generate_payload("true"/"false") -> str`** — пара payload'ов для
-   boolean-based стратегии. `"true"` должен «сработать» на уязвимой цели
-   (SQL инъекция `' OR 1=1-- `, SSRF на OOB-URL). `"false"` — контроль
-   (`' OR 1=2-- `, недоступный внутренний адрес). Пара — фундамент
-   compare_responses.
+   boolean-based стратегии.
 
 3. **`compare_responses(resp_true, resp_false) -> bool`** — детерминированное
-   правило: есть ли отличие, характерное для этого класса? Каждый класс
-   определяет свою метрику (статус, длина, содержимое маркера, тайминг,
-   OOB-hit). Возвращает `True` только если разница — сигнал уязвимости.
+   правило: есть ли отличие, характерное для этого класса?
 
 4. **`vulnerability_class -> VulnerabilityClass`** — регистрация в реестре
-   идёт по каноническому enum, а не по строке. Никаких алиасов на этой
-   границе — нормализация строк живёт отдельным слоем в `normalize_vuln_class`
-   на входе (cli, кандидаты от LLM).
+   идёт по каноническому enum.
 
-5. **`name -> str`** — стабильный slug валидатора (пример: `"sqli_boolean_v1"`).
-   Пишется в `runs.validator` sqlite-метрик и логи.
+5. **`name -> str`** — стабильный slug валидатора.
 
-`ValidationEvidence` — pydantic-модель (frozen) для машинных артефактов
-одного прогона: SHA256 тел ответов, статус-коды, длины, тайминги, OOB-hit.
-Судья (`proof_gate_v2`) читает поля напрямую — никакого парсинга строк.
+`ValidationEvidence` — pydantic-модель (frozen). Расширена под ТЗ M1 п.4-6:
+добавлены benign-control поля (payload_benign, status_benign, len_benign,
+sha256_benign, timing_ms_benign) для SQLi/XSS anti-FP и differential-flags
+(diff_reason, normalized_diff, false_like_benign, true_differs_from_benign)
+как детерминированные метки решения. Все новые поля опциональны — старые
+валидаторы и тесты продолжают работать.
 """
 
 from __future__ import annotations
@@ -47,6 +42,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from orchestrator.scope import Scope, ScopeViolation
 from orchestrator.types import Candidate, ValidatorContext, Verdict
 from tools.core.vulnerability_class import VulnerabilityClass
 
@@ -54,15 +50,22 @@ PayloadVariant = Literal["true", "false"]
 
 
 class ValidationEvidence(BaseModel):
-    """Машинные артефакты одного прогона boolean-based валидатора.
+    """Машинные артефакты одного прогона валидатора.
 
-    Формат стабилен между валидаторами; специфичные поля идут в `extra`
-    (SSRF складывает туда `oob_hits`, LFI — маркер, XSS — DOM-снимок).
+    Пара TRUE/FALSE обязательна (boolean-differential — базовый паттерн).
+    Опциональный benign-control (payload_benign/status_benign/len_benign/
+    sha256_benign/timing_ms_benign) — для SQLi/XSS anti-FP: помогает отличить
+    настоящий injection от tar-pit («все запросы отклоняются» → FALSE и benign
+    совпадают, TRUE не отличается → is_real=False).
+
+    Differential-flags (diff_reason, normalized_diff, false_like_benign,
+    true_differs_from_benign) — детерминированные метки решения. Судья
+    (`proof_gate_v2`) читает их напрямую.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    # Пара payload'ов, которую валидатор реально отправил.
+    # Пара TRUE/FALSE — обязательна.
     payload_true: str
     payload_false: str
 
@@ -74,9 +77,22 @@ class ValidationEvidence(BaseModel):
     sha256_true: str = Field(min_length=64, max_length=64)
     sha256_false: str = Field(min_length=64, max_length=64)
 
-    # Тайминг в миллисекундах — для timing-based и мониторинга.
+    # Тайминг в миллисекундах.
     timing_ms_true: float = Field(ge=0.0)
     timing_ms_false: float = Field(ge=0.0)
+
+    # Benign-control (опциональный третий запрос для anti-FP).
+    payload_benign: str | None = None
+    status_benign: int | None = Field(default=None, ge=0)
+    len_benign: int | None = Field(default=None, ge=0)
+    sha256_benign: str | None = Field(default=None, min_length=64, max_length=64)
+    timing_ms_benign: float | None = Field(default=None, ge=0.0)
+
+    # Differential-flags (детерминированные метки решения).
+    diff_reason: str | None = None
+    normalized_diff: bool | None = None
+    false_like_benign: bool | None = None
+    true_differs_from_benign: bool | None = None
 
     # OOB (для ssrf/xxe/cmdi/blind-классов).
     oob_hit: bool = False
@@ -94,6 +110,31 @@ class ValidationEvidence(BaseModel):
         """Хэш тела ответа (используется наследниками). Без соли."""
         raw = data.encode("utf-8", errors="replace") if isinstance(data, str) else data
         return hashlib.sha256(raw).hexdigest()
+
+
+def check_scope(ctx: ValidatorContext, url: str) -> str | None:
+    """Проверка scope перед сетевым действием (defence in depth).
+
+    Валидатор вызывает эту функцию первой строкой в `validate()` — если scope
+    задан через `ctx.extra["scope"]` (тип `Scope`) и URL не в нём, возвращает
+    строку-reason. Если scope не задан — возвращает None (pipeline уже
+    проверил на своём уровне).
+
+    Возвращает:
+        `None` — можно продолжать сетевые действия.
+        `"out_of_scope"` — цель НЕ в scope, валидатор ДОЛЖЕН вернуть
+        `Verdict(is_real=False, reason="out_of_scope")`.
+    """
+    scope = None
+    if ctx.extra:
+        scope = ctx.extra.get("scope")
+    if scope is None or not isinstance(scope, Scope):
+        return None
+    try:
+        scope.assert_in_scope(url)
+    except ScopeViolation:
+        return "out_of_scope"
+    return None
 
 
 class BaseValidator(ABC):
@@ -129,36 +170,14 @@ class BaseValidator(ABC):
 
     @abstractmethod
     def compare_responses(self, resp_true: Any, resp_false: Any) -> bool:
-        """Есть ли разница между ответами, характерная для этого класса?
-
-        Возвращает True — сигнал уязвимости; False — цель не подтверждает.
-        Метрика (статус, длина, sha256, тайминг, маркер) — на усмотрение
-        наследника, но правило должно быть детерминированным.
-        """
+        """Есть ли разница между ответами, характерная для этого класса?"""
 
     @abstractmethod
     def validate(self, candidate: Candidate, ctx: ValidatorContext) -> Verdict:
-        """Прогон валидатора. Sync — pipeline вызывает под ThreadPoolExecutor.
-
-        Наследник обязан:
-          1. Собрать payload'ы через `generate_payload("true"/"false")`.
-          2. Выполнить два запроса (или больше — если replay/OOB-poll).
-          3. Вычислить `is_real` через `compare_responses`.
-          4. Собрать `ValidationEvidence` (sha256, статусы, длины, тайминги).
-          5. Обернуть исключения → `Verdict(is_real=False, confidence=0.0,
-             reason=<exc>)`. Никогда не бросать наружу.
-          6. Заполнить `Verdict.bug_class = self.vulnerability_class.value`,
-             `Verdict.validator = self.name`.
-          7. Установить `Verdict.artifacts = evidence.to_dict()`.
-        """
+        """Прогон валидатора. Sync — pipeline вызывает под ThreadPoolExecutor."""
 
     def as_failure(self, exc: BaseException) -> Verdict:
-        """Хэлпер для безопасной обёртки исключения.
-
-        Использовать в `except:` веткё `validate()`. Приводит `Exception` к
-        безопасному `Verdict(is_real=False, confidence=0.0)` с сохранением
-        типа и сообщения — для последующего анализа причин FN.
-        """
+        """Хэлпер для безопасной обёртки исключения."""
         return Verdict(
             is_real=False,
             evidence="",
@@ -166,4 +185,15 @@ class BaseValidator(ABC):
             bug_class=self.vulnerability_class.value,
             validator=self.name,
             reason=f"{type(exc).__name__}: {exc}",
+        )
+
+    def _out_of_scope_verdict(self, target: str) -> Verdict:
+        """Стандартный Verdict для случая out-of-scope цели."""
+        return Verdict(
+            is_real=False,
+            evidence=f"target {target!r} is not in configured scope",
+            confidence=0.0,
+            bug_class=self.vulnerability_class.value,
+            validator=self.name,
+            reason="out_of_scope",
         )
