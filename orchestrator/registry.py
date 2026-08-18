@@ -1,65 +1,62 @@
-"""Реестр валидаторов bug_class → Validator.
+"""DEPRECATED — используйте `tools.validators.registry` + `tools.validators.normalize`.
 
-Класс-алиасы нормализуются в один канонический (напр. `idor` и `bola` → `idor`).
-Валидаторы регистрируются декоратором `@register("idor", "bola")` при импорте.
+Файл оставлен как **тонкий deprecation shim** после M1 п.3: старый registry с
+13 строковыми алиасами удалён, единственный источник алиасов теперь —
+`tools.validators.normalize.normalize_vuln_class` (входная граница), а реестр
+валидаторов ключевируется каноническим `VulnerabilityClass` enum.
 """
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+import warnings
+from collections.abc import Callable
+from typing import Any
 
-from orchestrator.types import ValidatorContext, Verdict
+from tools.validators import registry as _new_registry
+from tools.validators.base import BaseValidator
+from tools.validators.normalize import normalize_vuln_class
 
-ALIASES: dict[str, str] = {
-    "bola": "idor",
-    "broken_object_level_authz": "idor",
-    "path_traversal": "lfi",
-    "cmd_injection": "command_injection",
-    "os_command_injection": "command_injection",
-    "template_injection": "ssti",
-    "server_side_template_injection": "ssti",
-    "server_side_request_forgery": "ssrf",
-    "cross_site_scripting": "xss",
-    "xml_external_entity": "xxe",
-    "prompt_inject": "prompt_injection",
-    "rag_inject": "prompt_injection",
-    "mem_poison": "prompt_injection",
-}
+warnings.warn(
+    "orchestrator.registry is deprecated; use tools.validators.registry "
+    "and tools.validators.normalize.normalize_vuln_class instead",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
+ALIASES: dict[str, str] = {}
 
 
-@runtime_checkable
-class Validator(Protocol):
-    bug_class: str
-
-    def validate(self, finding: dict[str, Any], ctx: ValidatorContext) -> Verdict: ...
+def norm_class(raw: str) -> str:
+    vc = normalize_vuln_class(raw)
+    return vc.value if vc else raw.strip().lower().replace("-", "_")
 
 
-_REGISTRY: dict[str, Validator] = {}
-
-
-def norm_class(bug_class: str) -> str:
-    key = bug_class.strip().lower().replace("-", "_")
-    return ALIASES.get(key, key)
-
-
-def register(*classes: str):  # noqa: ANN201
-    def _wrap(cls: type) -> type:
-        inst = cls()
+def register(*classes: str) -> Callable[[type[Any]], type[Any]]:
+    def _wrap(cls: type[Any]) -> type[Any]:
+        if not issubclass(cls, BaseValidator):
+            for c in classes:
+                vc = normalize_vuln_class(c)
+                if vc is not None:
+                    _new_registry._REGISTRY[vc] = cls()  # type: ignore[assignment]
+            return cls
         for c in classes:
-            _REGISTRY[norm_class(c)] = inst  # type: ignore[assignment]
+            vc = normalize_vuln_class(c)
+            if vc is None:
+                raise ValueError(f"unknown class in legacy register(): {c!r}")
+            _new_registry.register(vc)(cls)
         return cls
 
     return _wrap
 
 
-def get(bug_class: str) -> Validator | None:
-    return _REGISTRY.get(norm_class(bug_class))
+def get(raw: str) -> Any | None:
+    vc = normalize_vuln_class(raw)
+    return _new_registry.get(vc) if vc is not None else None
 
 
 def known_classes() -> list[str]:
-    return sorted(_REGISTRY.keys())
+    return [v.value for v in _new_registry.known_classes()]
 
 
 def clear() -> None:
-    """Только для тестов."""
-    _REGISTRY.clear()
+    _new_registry.clear()
