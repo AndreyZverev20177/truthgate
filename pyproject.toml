@@ -58,7 +58,17 @@ extend-exclude = ["benchmarks/**/app"]
 
 [tool.ruff.lint]
 select = ["E","F","W","I","B","UP","SIM","S","RUF","PL"]
-ignore = ["S101","PLR0913","PLR2004","S603","S607"]
+ignore = [
+    "S101", "PLR0913", "PLR2004", "S603", "S607",
+    # Русскоязычные docstrings/комментарии — Cyrillic homoglyph warnings ложны здесь.
+    "RUF001", "RUF002", "RUF003",
+    # Валидаторы по природе большие (decision tree на условиях) — PLR не помогает.
+    "PLR0915", "PLR0912", "PLR0911",
+    # Import-inside-function иногда нужен для anti-cycle.
+    "PLC0415",
+    # Mutable default (dict) — pydantic Field(default_factory=dict) паттерн.
+    "B008",
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*" = ["S","PLR"]
