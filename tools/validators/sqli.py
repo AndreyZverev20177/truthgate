@@ -29,6 +29,17 @@
 
 Инвариант: никаких исключений наружу — обёрнуто в `Verdict` через
 `as_failure()`. Никаких headless/heavy-deps: только httpx+stdlib.
+
+**v1 known limitations (см. issues на v2):**
+- UNION canary предполагает 1 колонку. Многоколоночные — задача v2
+  (перебор `NULL`-колонок 1..4).
+- Полный прогон с `timing_based=True` и `replays=3` может занять >10s
+  и упереться в pipeline-таймаут (`ThreadPoolExecutor + future.result(
+  timeout=10)`). Для боевого прогона либо поднимать pipeline timeout для
+  SQLI до 30s, либо запускать `timing_based` вне общего pipeline.
+- Расширенный `replays_total=3` увеличивает запросов на цель до ~13.
+  Per-host rate-limiter должен это учитывать; иначе 429 от собственного
+  лимитера триггернёт WAF-детект (ироничный self-FP).
 """
 
 from __future__ import annotations
@@ -396,10 +407,14 @@ class SQLiValidator(BaseValidator):
                 # Error-based fingerprint — доп. probe `'`.
                 # Всегда полезно как метаданные; если boolean НЕ прошёл — можем
                 # апгрейдить до LOW-tier PASS при строгом anti-FP.
+                #
+                # ВАЖНО: НЕ стрипаем `_ERROR_PROBE_PAYLOAD` из err-тела — иначе
+                # вырезаются все `'`, а сигнатура SQLite (`near "'": syntax
+                # error`) содержит кавычку → мёртвый fingerprint. echo-очистка
+                # тут не нужна: сигнатуры и так специфичны, а сравнение —
+                # substring, не sha256.
                 err_probe = self._send(client, candidate, ctx, _ERROR_PROBE_PAYLOAD)
-                err_body_norm = _normalize_body(
-                    err_probe["body"], [_ERROR_PROBE_PAYLOAD, bng_value, bng_pw]
-                )
+                err_body_norm = _normalize_body(err_probe["body"], [bng_value, bng_pw])
                 benign_body_norm = _normalize_body(
                     last["rc"]["body"], [bng_value, bng_pw]
                 )
@@ -427,6 +442,7 @@ class SQLiValidator(BaseValidator):
                 time_delta_s: float | None = None
                 extra_flags["timing_based_enabled"] = timing_based_enabled
 
+                time_delta_ok = 0
                 if timing_based_enabled and not is_real and not waf_blocked:
                     if numeric_base is not None:
                         sleep_payload = _TIME_SLEEP_NUMERIC_TEMPLATE.format(
@@ -434,23 +450,30 @@ class SQLiValidator(BaseValidator):
                         )
                     else:
                         sleep_payload = _TIME_SLEEP_TEMPLATE.format(s=_TIME_SLEEP_SECONDS)
-                    # Два прогона: первый + retry для стабильности.
-                    delta_ok = 0
-                    last_delta: float = 0.0
+                    # Дельта относительно benign — не абсолютное время. Медленный
+                    # сам по себе endpoint (benign=5s) не должен давать FP.
+                    benign_time_s = float(last["rc"]["timing_ms"]) / 1000.0
+                    # Два прогона для стабильности.
+                    last_abs_s: float = 0.0
+                    last_delta_s: float = 0.0
                     for _ in range(2):
                         rs = self._send(client, candidate, ctx, sleep_payload)
-                        last_delta = float(rs["timing_ms"]) / 1000.0
-                        if last_delta >= _TIME_DELTA_THRESHOLD_S:
-                            delta_ok += 1
-                    time_delta_s = last_delta
-                    if delta_ok >= 2:
+                        last_abs_s = float(rs["timing_ms"]) / 1000.0
+                        last_delta_s = last_abs_s - benign_time_s
+                        if last_delta_s >= _TIME_DELTA_THRESHOLD_S:
+                            time_delta_ok += 1
+                    time_delta_s = last_delta_s
+                    extra_flags["time_benign_baseline_s"] = round(benign_time_s, 3)
+                    extra_flags["time_abs_s_last"] = round(last_abs_s, 3)
+                    if time_delta_ok >= 2:
                         time_based_confirmed = True
                         is_real = True
                         reason = "time_based_confirmed"
-                        diff_reason = f"sleep_delay_ge_{int(_TIME_DELTA_THRESHOLD_S)}s"
+                        diff_reason = f"sleep_delta_vs_benign_ge_{int(_TIME_DELTA_THRESHOLD_S)}s"
                         confidence = _CONF_TIME_BASED
 
                 extra_flags["time_based_confirmed"] = time_based_confirmed
+                extra_flags["time_delta_ok_count"] = time_delta_ok
                 if time_delta_s is not None:
                     extra_flags["time_delta_s_last"] = round(time_delta_s, 3)
 
@@ -500,6 +523,23 @@ class SQLiValidator(BaseValidator):
                         f"benign→{last['st_c']} ({reason})."
                     )
 
+                # Осмысленные replays_passed/replays_total под конкретный reason
+                # (proof-gate M3 читает эти поля как "стабильность
+                # доказательства"; 0/3 для успешного error/time-based
+                # выглядело бы как слабое доказательство, хотя оно самодостаточно).
+                if reason == "error_based_confirmed":
+                    verdict_replays_passed = 1
+                    verdict_replays_total = 1
+                elif reason == "time_based_confirmed":
+                    verdict_replays_passed = time_delta_ok
+                    verdict_replays_total = 2
+                elif is_real:
+                    verdict_replays_passed = diff_yes_count
+                    verdict_replays_total = replays_total
+                else:
+                    verdict_replays_passed = 0
+                    verdict_replays_total = replays_total
+
                 return Verdict(
                     is_real=is_real,
                     evidence=evidence_text,
@@ -507,8 +547,8 @@ class SQLiValidator(BaseValidator):
                     bug_class=self.vulnerability_class.value,
                     validator=self.name,
                     reason=reason,
-                    replays_passed=diff_yes_count if is_real else 0,
-                    replays_total=replays_total,
+                    replays_passed=verdict_replays_passed,
+                    replays_total=verdict_replays_total,
                     artifacts=ev.to_dict(),
                 )
         except Exception as e:
