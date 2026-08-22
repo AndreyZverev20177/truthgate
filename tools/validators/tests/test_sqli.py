@@ -438,6 +438,99 @@ def test_sqli_replays_stability_multi_run() -> None:
     assert counter["n"] >= 9
 
 
+def test_sqli_error_based_sqlite_signature_survives_normalization() -> None:
+    """Regression: SQLite-сигнатура содержит `'`, echo-strip раньше её убивал."""
+    def handler(params: dict[str, str]) -> tuple[int, bytes]:
+        user = params.get("username", "")
+        if user == "'":
+            return 500, b"<html><body>near \"'\": syntax error at line 1</body></html>"
+        return 401, b'{"error":"invalid credentials"}'
+
+    v = SQLiValidator()
+    verdict = v.validate(_candidate(), _ctx_with(_make_transport(handler)))
+
+    assert verdict.is_real is True, verdict.evidence
+    assert verdict.reason == "error_based_confirmed"
+    art = verdict.artifacts
+    assert art["extra"]["db_error_fingerprint"] == "sqlite"
+    # Minor 7: осмысленные replays для error-based.
+    assert verdict.replays_passed == 1
+    assert verdict.replays_total == 1
+
+
+def test_sqli_time_based_no_fp_on_slow_benign(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bug 2 regression: benign сам по себе медленный (~5s). Абсолютный порог
+    дал бы FP; правильная реализация меряет ДЕЛЬТУ vs benign и не даёт PASS.
+    """
+    def handler(params: dict[str, str]) -> tuple[int, bytes]:
+        return 401, b'{"error":"invalid"}'
+
+    # Все запросы «идут по ~5.5s» — benign и sleep одинаково медленные.
+    # Дельта ≈ 0 → time-based НЕ должен PASS.
+    def slow_ticks() -> list[float]:
+        t = 0.0
+        ticks: list[float] = []
+        # Round-1 (TRUE, FALSE, benign) + err-probe: 4 запроса, каждый 5.5s.
+        for _ in range(4):
+            ticks.extend([t, t + 5.5])
+            t += 5.6
+        # SLEEP: 2 прогона, каждый тоже 5.5s (сервер медленный, а не SLEEP работает).
+        for _ in range(2):
+            ticks.extend([t, t + 5.5])
+            t += 5.6
+        return ticks
+
+    ticks = iter(slow_ticks())
+    monkeypatch.setattr("tools.validators.sqli.time.monotonic", lambda: next(ticks))
+
+    cand = Candidate(
+        id="cand-sqli-time-slow",
+        bug_class="sqli",
+        target=TARGET,
+        path=LOGIN_PATH,
+        method="POST",
+        param="username",
+        meta={"password_param": "password", "content_type": "form", "timing_based": True},
+    )
+    v = SQLiValidator()
+    verdict = v.validate(cand, _ctx_with(_make_transport(handler)))
+
+    assert verdict.is_real is False, (
+        f"time-based НЕ должен PASS на медленном сервере (delta≈0). Got: {verdict.evidence}"
+    )
+    art = verdict.artifacts
+    assert art["extra"]["time_based_confirmed"] is False
+    # Дельта близка к нулю, не выше порога.
+    assert abs(art["extra"]["time_delta_s_last"]) < 1.0
+    assert art["extra"]["time_benign_baseline_s"] > 4.0
+
+
+def test_sqli_time_based_pass_replays_semantics(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Minor 7: time-based PASS должен давать replays_passed=2, replays_total=2."""
+    def handler(params: dict[str, str]) -> tuple[int, bytes]:
+        return 401, b'{"error":"invalid"}'
+
+    ticks = iter(_gen_monotonic_ticks())
+    monkeypatch.setattr("tools.validators.sqli.time.monotonic", lambda: next(ticks))
+
+    cand = Candidate(
+        id="cand-sqli-time-2",
+        bug_class="sqli",
+        target=TARGET,
+        path=LOGIN_PATH,
+        method="POST",
+        param="username",
+        meta={"password_param": "password", "content_type": "form", "timing_based": True},
+    )
+    v = SQLiValidator()
+    verdict = v.validate(cand, _ctx_with(_make_transport(handler)))
+
+    assert verdict.is_real is True
+    assert verdict.reason == "time_based_confirmed"
+    assert verdict.replays_passed == 2
+    assert verdict.replays_total == 2
+
+
 def test_sqli_replays_unstable_no_pass() -> None:
     """replays=3, только 1 раунд с diff — недостаточно (required=2)."""
     tautology = "' OR '1'='1' -- "
